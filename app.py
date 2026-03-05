@@ -10,7 +10,8 @@ import time
 import tempfile
 import ast
 import re
-
+import logging
+from datetime import datetime
 
 # === CONSTANTE PENTRU LIMITE (FIX MEMORY LEAK) ===
 MAX_MESSAGES_IN_MEMORY = 100
@@ -18,7 +19,42 @@ MAX_MESSAGES_TO_SEND_TO_AI = 20
 MAX_MESSAGES_IN_DB_PER_SESSION = 500
 CLEANUP_DAYS_OLD = 7
 
+# === MODELE AI DISPONIBILE ===
+AVAILABLE_MODELS = [
+    "models/gemini-2.5-flash",
+    "models/gemini-1.5-flash", 
+    "models/gemini-1.5-pro"
+]
+
+# === CONFIGURARE LOGGING ===
+def setup_logging():
+    """Configurează sistemul de logging."""
+    logging.basicConfig(
+        filename='profesor_ai.log',
+        level=logging.INFO,
+        format='%(asctime)s - %(levelname)s - %(message)s',
+        encoding='utf-8'
+    )
+
+setup_logging()
+
+def log_error(error_type: str, error_msg: str, session_id: str = None):
+    """Loghează erori pentru debugging."""
+    timestamp = datetime.now().isoformat()
+    session_info = f" | Session: {session_id}" if session_id else ""
+    log_entry = f"[{timestamp}] {error_type}: {error_msg}{session_info}"
+    
+    # Log în fișier
+    logging.error(log_entry)
+    
+    # Poți adăuga și notificări pentru tine (email, Telegram etc.) aici
+    # Exemplu: trimite_email_alert(log_entry) dacă e eroare critică
+
 # === ISTORIC CONVERSAȚII ===
+def invalidate_session_cache():
+    """Invalidează cache-ul sesiunilor."""
+    st.session_state["_sess_list_ts"] = 0
+
 def get_session_list(limit: int = 20) -> list[dict]:
     """Returnează lista sesiunilor — 2 query-uri totale în loc de N*2."""
     # Folosește cache de 30s pentru a nu re-interoga la fiecare rerun minor
@@ -29,6 +65,8 @@ def get_session_list(limit: int = 20) -> list[dict]:
 
     try:
         supabase = get_supabase_client()
+        if not supabase:
+            return cache_val or []
 
         # Query 1: sesiunile
         resp = (
@@ -82,7 +120,8 @@ def get_session_list(limit: int = 20) -> list[dict]:
         return result
 
     except Exception as e:
-        print(f"Eroare la încărcarea sesiunilor: {e}")
+        error_msg = f"Eroare la încărcarea sesiunilor: {e}"
+        log_error("SessionList", error_msg, st.session_state.get("session_id"))
         return cache_val or []
 
 
@@ -92,6 +131,7 @@ def switch_session(new_session_id: str):
     st.session_state.messages = []
     st.query_params["sid"] = new_session_id
     inject_session_js()
+    invalidate_session_cache()  # Invalidează cache-ul
 
 
 def format_time_ago(timestamp: float) -> str:
@@ -110,8 +150,6 @@ def format_time_ago(timestamp: float) -> str:
         return f"{days} zile în urmă"
 
 
-
-
 # === SUPABASE CLIENT + FALLBACK ===
 @st.cache_resource
 def get_supabase_client() -> Client | None:
@@ -122,7 +160,8 @@ def get_supabase_client() -> Client | None:
         if not url or not key:
             return None
         return create_client(url, key)
-    except Exception:
+    except Exception as e:
+        log_error("SupabaseClient", str(e))
         return None
 
 
@@ -138,6 +177,7 @@ def _mark_supabase_offline():
     st.session_state["_sb_online"] = False
     if was_online:
         st.toast("⚠️ Baza de date offline — modul local activat.", icon="📴")
+        log_error("Supabase", "Conexiune pierdută", st.session_state.get("session_id"))
 
 
 def _mark_supabase_online():
@@ -146,6 +186,7 @@ def _mark_supabase_online():
     st.session_state["_sb_online"] = True
     if was_offline:
         st.toast("✅ Conexiunea restabilită!", icon="🟢")
+        log_error("Supabase", "Conexiune restabilită", st.session_state.get("session_id"))
         _flush_offline_queue()
 
 
@@ -166,7 +207,8 @@ def _flush_offline_queue():
     for item in queue:
         try:
             client.table("history").insert(item).execute()
-        except Exception:
+        except Exception as e:
+            log_error("OfflineQueue", f"Eroare sincronizare: {e}", item.get("session_id"))
             failed.append(item)
     st.session_state["_offline_queue"] = failed
     if not failed:
@@ -175,6 +217,27 @@ def _flush_offline_queue():
 # === VOCI EDGE TTS (VOCE BĂRBAT) ===
 VOICE_MALE_RO = "ro-RO-EmilNeural"
 VOICE_FEMALE_RO = "ro-RO-AlinaNeural"
+
+# === RATE LIMITING PENTRU TTS ===
+def can_use_tts() -> bool:
+    """Verifică dacă putem folosi TTS (rate limiting)."""
+    now = time.time()
+    
+    # Resetare zilnică
+    if "tts_last_used" not in st.session_state:
+        st.session_state.tts_last_used = 0
+        st.session_state.tts_count_today = 0
+    
+    if now - st.session_state.tts_last_used > 86400:  # 24 ore
+        st.session_state.tts_count_today = 0
+    
+    # Limitează la 50 de generări pe zi
+    if st.session_state.tts_count_today >= 50:
+        return False
+    
+    st.session_state.tts_last_used = now
+    st.session_state.tts_count_today += 1
+    return True
 
 
 st.set_page_config(page_title="Profesor Liceu", page_icon="🎓", layout="wide", initial_sidebar_state="expanded")
@@ -258,8 +321,6 @@ st.markdown("""
         box-shadow: 0 2px 8px rgba(0,0,0,0.4);
     }
 
-
-
     /* Typing indicator */
     .typing-indicator {
         display: flex;
@@ -307,11 +368,14 @@ def cleanup_old_sessions(days_old: int = CLEANUP_DAYS_OLD):
     st.session_state["_last_cleanup"] = time.time()
     try:
         supabase = get_supabase_client()
+        if not supabase:
+            return
         cutoff_time = time.time() - (days_old * 24 * 60 * 60)
         supabase.table("history").delete().lt("timestamp", cutoff_time).execute()
         supabase.table("sessions").delete().lt("last_active", cutoff_time).execute()
+        invalidate_session_cache()  # Invalidează cache-ul după cleanup
     except Exception as e:
-        print(f"Eroare la cleanup: {e}")
+        log_error("Cleanup", str(e))
 
 
 def save_message_to_db(session_id, role, content):
@@ -327,10 +391,14 @@ def save_message_to_db(session_id, role, content):
         return
     try:
         client = get_supabase_client()
+        if not client:
+            _get_offline_queue().append(record)
+            return
         client.table("history").insert(record).execute()
         _mark_supabase_online()
+        invalidate_session_cache()  # Invalidează cache-ul
     except Exception as e:
-        print(f"Eroare DB save: {e}")
+        log_error("DBSave", str(e), session_id)
         _mark_supabase_offline()
         _get_offline_queue().append(record)
 
@@ -342,6 +410,8 @@ def load_history_from_db(session_id, limit: int = MAX_MESSAGES_IN_MEMORY):
         return st.session_state.get("messages", [])[-limit:]
     try:
         client = get_supabase_client()
+        if not client:
+            return st.session_state.get("messages", [])[-limit:]
         response = (
             client.table("history")
             .select("role, content, timestamp")
@@ -352,7 +422,7 @@ def load_history_from_db(session_id, limit: int = MAX_MESSAGES_IN_MEMORY):
         )
         return [{"role": row["role"], "content": row["content"]} for row in response.data]
     except Exception as e:
-        print(f"Eroare la încărcarea istoricului: {e}")
+        log_error("DBLoad", str(e), session_id)
         return st.session_state.get("messages", [])[-limit:]
 
 
@@ -360,15 +430,20 @@ def clear_history_db(session_id):
     """Șterge istoricul pentru o sesiune din Supabase."""
     try:
         supabase = get_supabase_client()
+        if not supabase:
+            return
         supabase.table("history").delete().eq("session_id", session_id).execute()
+        invalidate_session_cache()  # Invalidează cache-ul
     except Exception as e:
-        print(f"Eroare la ștergerea istoricului: {e}")
+        log_error("DBClear", str(e), session_id)
 
 
 def trim_db_messages(session_id: str):
     """Limitează mesajele din DB pentru o sesiune (FIX MEMORY LEAK)."""
     try:
         supabase = get_supabase_client()
+        if not supabase:
+            return
 
         # Numără mesajele sesiunii
         count_resp = (
@@ -394,7 +469,7 @@ def trim_db_messages(session_id: str):
             if ids_to_delete:
                 supabase.table("history").delete().in_("id", ids_to_delete).execute()
     except Exception as e:
-        print(f"Eroare la curățarea DB: {e}")
+        log_error("DBTrim", str(e), session_id)
 
 
 # === SESSION MANAGEMENT (SUPABASE) ===
@@ -406,10 +481,20 @@ def generate_unique_session_id() -> str:
     return f"{uuid_part}{time_part}{random_part}"
 
 
+def validate_session_id(session_id: str) -> bool:
+    """Validează formatul session_id."""
+    if not session_id or len(session_id) < 16:
+        return False
+    # Verifică caractere valide (hex)
+    return bool(re.match(r'^[a-f0-9]{32,}$', session_id))
+
+
 def session_exists_in_db(session_id: str) -> bool:
     """Verifică dacă un session_id există deja în Supabase."""
     try:
         supabase = get_supabase_client()
+        if not supabase:
+            return False
         response = (
             supabase.table("sessions")
             .select("session_id")
@@ -418,7 +503,8 @@ def session_exists_in_db(session_id: str) -> bool:
             .execute()
         )
         return len(response.data) > 0
-    except Exception:
+    except Exception as e:
+        log_error("SessionExists", str(e), session_id)
         return False
 
 
@@ -428,14 +514,17 @@ def register_session(session_id: str):
         return
     try:
         client = get_supabase_client()
+        if not client:
+            return
         now = time.time()
         client.table("sessions").upsert({
             "session_id": session_id,
             "created_at": now,
             "last_active": now
         }).execute()
+        invalidate_session_cache()  # Invalidează cache-ul
     except Exception as e:
-        print(f"Eroare la înregistrarea sesiunii: {e}")
+        log_error("RegisterSession", str(e), session_id)
 
 
 def update_session_activity(session_id: str):
@@ -448,11 +537,13 @@ def update_session_activity(session_id: str):
         return
     try:
         client = get_supabase_client()
+        if not client:
+            return
         client.table("sessions").update({
             "last_active": time.time()
         }).eq("session_id", session_id).execute()
     except Exception as e:
-        print(f"Eroare la actualizarea sesiunii: {e}")
+        log_error("UpdateSession", str(e), session_id)
 
 
 def inject_session_js():
@@ -497,13 +588,13 @@ def get_or_create_session_id() -> str:
     # 1. Deja în sesiunea curentă Streamlit
     if "session_id" in st.session_state:
         existing_id = st.session_state.session_id
-        if existing_id and len(existing_id) >= 16:
+        if existing_id and validate_session_id(existing_id):
             return existing_id
 
     # 2. Restaurat din localStorage via ?sid= în URL (primul load după restart telefon)
     if "sid" in st.query_params:
         sid_from_storage = st.query_params["sid"]
-        if sid_from_storage and len(sid_from_storage) >= 16:
+        if sid_from_storage and validate_session_id(sid_from_storage):
             if session_exists_in_db(sid_from_storage):
                 return sid_from_storage
 
@@ -554,6 +645,30 @@ def save_message_with_limits(session_id: str, role: str, content: str):
     trim_session_messages()
 
 
+# === FUNCȚIE PENTRU SELECTAREA MODELULUI AI ===
+def get_ai_model():
+    """Returnează modelul AI disponibil, cu fallback."""
+    current_model = st.session_state.get("ai_model", AVAILABLE_MODELS[0])
+    
+    # Verifică dacă modelul curent e disponibil
+    try:
+        genai.get_model(current_model)
+        return current_model
+    except Exception as e:
+        log_error("ModelCheck", f"Model {current_model} indisponibil: {e}")
+        # Încearcă următorul model
+        for model in AVAILABLE_MODELS:
+            try:
+                genai.get_model(model)
+                st.session_state.ai_model = model
+                return model
+            except Exception as e2:
+                log_error("ModelCheck", f"Fallback {model} indisponibil: {e2}")
+                continue
+    
+    # Fallback la primul model și sperăm
+    log_error("ModelCheck", "Niciun model disponibil, folosesc fallback")
+    return AVAILABLE_MODELS[0]
 
 
 # === AUDIO / TTS FUNCTIONS ===
@@ -755,10 +870,10 @@ _LATEX_PATTERNS: list[tuple[str, str]] = [
     (r'\\lt\b', ' mai mic decât '), (r'\\gt\b', ' mai mare decât '),
 ]
 
-# Regex precompilat pentru unități (număr + unitate)
+# Regex precompilat pentru unități (număr + unitate) - cu lookbehind pentru cuvinte
 _NUM = r'(\d+[.,]?\d*)'
 _UNIT_PATTERNS: list[tuple[re.Pattern, str]] = [
-    (re.compile(_NUM + r'\s*' + re.escape(unit) + r'\b'), r'\1 ' + pron)
+    (re.compile(r'(?<!\w)' + _NUM + r'\s*' + re.escape(unit) + r'\b'), r'\1 ' + pron)
     for unit, pron in _UNITS
 ]
 
@@ -853,12 +968,17 @@ async def _generate_audio_edge_tts(text: str, voice: str = VOICE_MALE_RO) -> byt
         return audio_data.getvalue()
         
     except Exception as e:
-        print(f"Eroare Edge TTS: {e}")
+        log_error("TTS", str(e))
         return None
 
 
 def generate_professor_voice(text: str, voice: str = VOICE_MALE_RO) -> BytesIO:
     """Wrapper sincron pentru Edge TTS - voce de bărbat (Domnul Profesor)."""
+    # Verifică rate limiting
+    if not can_use_tts():
+        st.caption("🔇 Limită zilnică de voce atinsă (50 generări/zi)")
+        return None
+        
     try:
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)
@@ -875,7 +995,7 @@ def generate_professor_voice(text: str, voice: str = VOICE_MALE_RO) -> BytesIO:
         return None
         
     except Exception as e:
-        print(f"Eroare la generarea vocii: {e}")
+        log_error("Voice", str(e))
         return None
 
 
@@ -1258,7 +1378,7 @@ def extract_text_from_photo(image_bytes: bytes, materie_label: str) -> str:
         import base64
         key = keys[st.session_state.get("key_index", 0)]
         genai.configure(api_key=key)
-        model = genai.GenerativeModel("models/gemini-2.5-flash")
+        model = genai.GenerativeModel(get_ai_model())  # Folosește funcția de fallback
 
         img_b64 = base64.b64encode(image_bytes).decode()
         prompt = (
@@ -1275,6 +1395,7 @@ def extract_text_from_photo(image_bytes: bytes, materie_label: str) -> str:
         ])
         return response.text.strip()
     except Exception as e:
+        log_error("PhotoOCR", str(e))
         return f"[Eroare la citirea pozei: {e}]"
 
 
@@ -1621,7 +1742,7 @@ def parse_quiz_response(response: str) -> tuple[str, dict]:
     """Extrage întrebările și răspunsurile corecte din răspunsul AI."""
     correct = {}
     clean_response = response
-
+    
     match = re.search(r'\[\[RASPUNSURI_CORECTE\]\](.*?)\[\[/RASPUNSURI_CORECTE\]\]',
                       response, re.DOTALL)
     if match:
@@ -1636,8 +1757,12 @@ def parse_quiz_response(response: str) -> tuple[str, dict]:
                     if ans in ['A', 'B', 'C', 'D']:
                         correct[q_num] = ans
                 except ValueError:
-                    pass
-
+                    continue
+    else:
+        # Încercăm să găsim răspunsurile în alt format
+        st.warning("⚠️ Formatul răspunsurilor nu a fost recunoscut. Verifică generarea quiz-ului.")
+        log_error("QuizParse", "Format răspunsuri nerecunoscut", st.session_state.get("session_id"))
+    
     return clean_response, correct
 
 
@@ -1774,31 +1899,43 @@ def run_quiz_ui():
 
 
 def run_chat_with_rotation(history_obj, payload, system_prompt=None):
-    """Rulează chat cu rotație automată a cheilor API."""
+    """Rulează chat cu rotație automată a cheilor API și fallback model."""
     active_prompt = system_prompt or st.session_state.get("system_prompt") or SYSTEM_PROMPT
     max_retries = len(keys) * 2
+    last_error = None
+    
     for attempt in range(max_retries):
         try:
             if st.session_state.key_index >= len(keys):
                 st.session_state.key_index = 0
             current_key = keys[st.session_state.key_index]
             genai.configure(api_key=current_key)
+            
+            # Folosește funcția de fallback pentru model
+            model_name = get_ai_model()
+            
             model = genai.GenerativeModel(
-                "models/gemini-2.5-flash",
+                model_name,
                 system_instruction=active_prompt,
                 safety_settings=safety_settings
             )
             chat = model.start_chat(history=history_obj)
             response_stream = chat.send_message(payload, stream=True)
+            
             for chunk in response_stream:
                 try:
                     if chunk.text:
                         yield chunk.text
                 except ValueError:
                     continue
+            
+            # Dacă am ajuns aici, totul e ok - ieșim din funcție
             return
+            
         except Exception as e:
+            last_error = e
             error_msg = str(e)
+            
             if "503" in error_msg or "overloaded" in error_msg:
                 st.toast("🐢 Reîncerc...", icon="⏳")
                 time.sleep(2)
@@ -1808,8 +1945,14 @@ def run_chat_with_rotation(history_obj, payload, system_prompt=None):
                 st.session_state.key_index = (st.session_state.key_index + 1) % len(keys)
                 continue
             else:
+                # Loghează eroarea necunoscută
+                log_error("ChatRotation", str(e), st.session_state.get("session_id"))
                 raise e
-    raise Exception("Serviciul este indisponibil momentan.")
+    
+    # Dacă am epuizat încercările
+    error_msg = f"Serviciul este indisponibil momentan. Ultima eroare: {last_error}"
+    log_error("ChatRotation", error_msg, st.session_state.get("session_id"))
+    raise Exception(error_msg)
 
 
 # === UI PRINCIPAL ===
@@ -1865,6 +2008,7 @@ with st.sidebar:
     if st.button("🗑️ Șterge Istoricul", type="primary"):
         clear_history_db(st.session_state.session_id)
         st.session_state.messages = []
+        invalidate_session_cache()  # Invalidează cache-ul
         st.rerun()
 
     enable_audio = st.checkbox("🔊 Voce", value=False)
@@ -1906,6 +2050,7 @@ with st.sidebar:
                     media_content = uploaded_pdf
                     st.success(f"✅ Gata: {uploaded_file.name}")
             except Exception as e:
+                log_error("PDFUpload", str(e), st.session_state.session_id)
                 st.error(f"Eroare upload PDF: {e}")
 
     st.divider()
@@ -1978,6 +2123,7 @@ with st.sidebar:
                     clear_history_db(s["session_id"])
                     if is_current:
                         st.session_state.messages = []
+                    invalidate_session_cache()  # Invalidează cache-ul
                     st.rerun()
 
     st.divider()
@@ -1987,6 +2133,8 @@ with st.sidebar:
         st.caption(f"📊 Mesaje în memorie: {msg_count}/{MAX_MESSAGES_IN_MEMORY}")
         st.caption(f"🔑 Cheie API activă: {st.session_state.key_index + 1}/{len(keys)}")
         st.caption(f"🆔 Sesiune: {st.session_state.session_id[:16]}...")
+        st.caption(f"🤖 Model AI: {st.session_state.get('ai_model', AVAILABLE_MODELS[0])}")
+        st.caption(f"🎤 TTS azi: {st.session_state.get('tts_count_today', 0)}/50")
 
 
 # === MAIN UI — BAC / QUIZ / CHAT ===
@@ -2086,3 +2234,4 @@ if user_input := st.chat_input("Întreabă profesorul..."):
                         
         except Exception as e:
             st.error(f"❌ Eroare: {e}")
+            log_error("Chat", str(e), st.session_state.session_id)
